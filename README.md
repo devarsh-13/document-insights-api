@@ -13,8 +13,8 @@ Built with **FastAPI**, **MongoDB**, **Redis** and **Celery**.
 Only Docker is needed. Nothing else to install.
 
 ```bash
-git clone <repository-url>
-cd document-insights
+git clone https://github.com/devarsh-13/document-insights-api.git
+cd document-insights-api
 docker compose up --build
 ```
 
@@ -122,6 +122,10 @@ curl 'http://localhost:8000/users/alice/documents?page=1&page_size=10&status=com
 **5. See the rate limit work** — submit four documents quickly. The fourth returns `429`, because each user may only have three being processed at once.
 
 **6. See the cache work** — submit the *exact same content* twice. The second one comes back instantly, already `completed`, with `"cached": true`. No worker involved.
+
+### Using Postman instead
+
+`postman_collection.json` in the repo root can be imported straight into Postman. It has one folder per endpoint, with ready-made requests covering the cache, the rate limit, and the error cases. Each request carries assertions that run automatically.
 
 ---
 
@@ -417,6 +421,7 @@ tests/
 Dockerfile
 docker-compose.yml
 .env.example
+postman_collection.json   Importable Postman collection, one folder per endpoint
 ```
 
 **A note on the Docker setup:** only the API is exposed on a port (8000). MongoDB and Redis are reachable between the containers but not from your machine — that avoids clashing with anything already installed locally, and not exposing databases publicly is the safer default. To inspect them during development, use `docker compose exec mongo mongosh`.
