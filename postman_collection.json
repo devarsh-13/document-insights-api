@@ -1,0 +1,339 @@
+{
+  "info": {
+    "name": "Document Insights API",
+    "description": "The API has exactly 4 endpoints, one folder each. Rate limiting and caching are not separate endpoints - both happen inside POST /documents. The requests inside each folder are different scenarios against that one endpoint.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000" },
+    { "key": "user_id", "value": "alice" },
+    { "key": "document_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "description": "Endpoint 1 of 4. Reports whether MongoDB and Redis are reachable.",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] },
+            "description": "Expect 200 and status 'healthy'. Returns 503 if MongoDB is down, and 'degraded' if only Redis is down."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('healthy', () => pm.expect(b.status).to.eql('healthy'));",
+                  "pm.test('mongodb up', () => pm.expect(b.components.mongodb.status).to.eql('up'));",
+                  "pm.test('redis up', () => pm.expect(b.components.redis.status).to.eql('up'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "POST /documents",
+      "description": "Endpoint 2 of 4. This single endpoint does everything on submission: validation, the content cache lookup, the per-user rate limit, saving to MongoDB, and queueing the background job. The requests below are scenarios against this one endpoint.",
+      "item": [
+        {
+          "name": "A. Submit - put your own text here",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"title\": \"Change this title to anything\",\n  \"content\": \"Change this to any text you like. It can be one sentence or many paragraphs, up to 100000 characters. The summarizer counts the words and sentences, then picks the most frequent meaningful words as keywords.\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/documents", "host": ["{{base_url}}"], "path": ["documents"] },
+            "description": "Expect 201 with status 'queued'. The document_id is saved automatically for the GET requests."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.test('queued', () => pm.expect(b.status).to.eql('queued'));",
+                  "pm.test('not cached', () => pm.expect(b.cached).to.eql(false));",
+                  "pm.collectionVariables.set('document_id', b.document_id);",
+                  "console.log('document_id saved:', b.document_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "B. Cache - resend the exact same content",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"title\": \"A different title is fine\",\n  \"content\": \"Change this to any text you like. It can be one sentence or many paragraphs, up to 100000 characters. The summarizer counts the words and sentences, then picks the most frequent meaningful words as keywords.\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/documents", "host": ["{{base_url}}"], "path": ["documents"] },
+            "description": "Same endpoint as A. Run this only after the GET poll shows 'completed'. The content must match request A exactly - the title can differ. Expect 201 with status 'completed' and cached true, returned instantly. No worker involved, and it does not use one of your 3 slots."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.test('completed immediately', () => pm.expect(b.status).to.eql('completed'));",
+                  "pm.test('served from cache', () => pm.expect(b.cached).to.eql(true));",
+                  "pm.test('summary included', () => pm.expect(b.summary).to.not.be.null);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "C. Rate limit - send this 4 times",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"ratelimit-demo\",\n  \"title\": \"Filler\",\n  \"content\": \"Edit one word here before each send so the content stays unique and does not hit the cache. Attempt one.\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/documents", "host": ["{{base_url}}"], "path": ["documents"] },
+            "description": "Same endpoint again. Change a word in content before each send, otherwise you get a cache hit instead. Sends 1-3 return 201. Send 4 returns 429, because this user already has 3 documents in progress."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const code = pm.response.code;",
+                  "pm.test('201 or 429', () => pm.expect([201, 429]).to.include(code));",
+                  "if (code === 429) {",
+                  "  const b = pm.response.json();",
+                  "  pm.test('correct error code', () => pm.expect(b.code).to.eql('active_job_limit_reached'));",
+                  "  pm.test('limit reported', () => pm.expect(b.limit).to.eql(3));",
+                  "  pm.test('Retry-After header', () => pm.expect(pm.response.headers.get('Retry-After')).to.eql('10'));",
+                  "  console.log('rate limited - expected on the 4th send');",
+                  "} else {",
+                  "  console.log('accepted - send again');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "D. Validation - empty user_id",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"user_id\": \"\",\n  \"title\": \"Test\",\n  \"content\": \"Some text.\"\n}" },
+            "url": { "raw": "{{base_url}}/documents", "host": ["{{base_url}}"], "path": ["documents"] },
+            "description": "Expect 422. Also try a user_id with spaces, a blank title, or missing content."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('422', () => pm.response.to.have.status(422));"] }
+            }
+          ]
+        },
+        {
+          "name": "E. Validation - unknown field rejected",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"alice\",\n  \"title\": \"Test\",\n  \"content\": \"Some text.\",\n  \"priority\": \"high\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/documents", "host": ["{{base_url}}"], "path": ["documents"] },
+            "description": "'priority' is not an accepted field. Expect 422 rather than it being silently ignored, so a typo fails loudly."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('422', () => pm.response.to.have.status(422));"] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "GET /documents/{id}",
+      "description": "Endpoint 3 of 4. Poll a single document for its status and, once ready, its summary.",
+      "item": [
+        {
+          "name": "A. Poll the document",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/documents/{{document_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["documents", "{{document_id}}"]
+            },
+            "description": "Uses the id saved by POST request A. Send it repeatedly: queued, then processing, then completed after 10-30 seconds. If a job randomly fails it goes back to queued and retries."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log('status:', b.status);",
+                  "pm.test('known status', () => pm.expect(['queued','processing','completed','failed']).to.include(b.status));",
+                  "if (b.status === 'completed') {",
+                  "  pm.test('summary present', () => pm.expect(b.summary).to.not.be.null);",
+                  "  console.log('summary:', b.summary.text);",
+                  "  console.log('keywords:', b.summary.keywords);",
+                  "  console.log('word count:', b.summary.word_count);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "B. Unknown id returns 404",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/documents/507f1f77bcf86cd799439011",
+              "host": ["{{base_url}}"],
+              "path": ["documents", "507f1f77bcf86cd799439011"]
+            },
+            "description": "A valid-looking id that does not exist."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));",
+                  "pm.test('error code', () => pm.expect(pm.response.json().code).to.eql('document_not_found'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "C. Malformed id returns 404",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/documents/this-is-not-an-id",
+              "host": ["{{base_url}}"],
+              "path": ["documents", "this-is-not-an-id"]
+            },
+            "description": "Not a valid MongoDB id at all. Still 404, never a 500."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('404', () => pm.response.to.have.status(404));"] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "GET /users/{id}/documents",
+      "description": "Endpoint 4 of 4. A paginated list of one user's documents, newest first.",
+      "item": [
+        {
+          "name": "A. List documents",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/users/{{user_id}}/documents?page=1&page_size=10",
+              "host": ["{{base_url}}"],
+              "path": ["users", "{{user_id}}", "documents"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "page_size", "value": "10" },
+                { "key": "status", "value": "completed", "disabled": true }
+              ]
+            },
+            "description": "Tick the 'status' box to filter by queued, processing, completed or failed. page_size is capped at 100."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('pagination fields', () => {",
+                  "  pm.expect(b).to.have.property('total');",
+                  "  pm.expect(b).to.have.property('total_pages');",
+                  "  pm.expect(b).to.have.property('has_next');",
+                  "});",
+                  "console.log('total:', b.total, '| page', b.page, 'of', b.total_pages);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "B. Invalid status filter returns 422",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/users/{{user_id}}/documents?status=banana",
+              "host": ["{{base_url}}"],
+              "path": ["users", "{{user_id}}", "documents"],
+              "query": [{ "key": "status", "value": "banana" }]
+            },
+            "description": "'banana' is not a valid status, so it is rejected before any application code runs."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('422', () => pm.response.to.have.status(422));"] }
+            }
+          ]
+        },
+        {
+          "name": "C. Unknown user returns an empty list",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/users/nobody-at-all/documents",
+              "host": ["{{base_url}}"],
+              "path": ["users", "nobody-at-all", "documents"]
+            },
+            "description": "Returns 200 with an empty list rather than 404. There is no user database, so the service cannot tell 'no such user' apart from 'user with no documents'."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 not 404', () => pm.response.to.have.status(200));",
+                  "pm.test('empty list', () => pm.expect(pm.response.json().total).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
